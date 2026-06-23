@@ -1,0 +1,319 @@
+# ============================================================================
+# rules.yaml  --  Knowledge Rules Engine for the AI-powered DBA Assistant
+# ============================================================================
+# Rules are DATA, not code. The engine (rule_engine.py) loads this file and
+# evaluates every rule against the flat `signals` produced by the derived
+# metrics layer. Adding / tuning a rule = editing this file only.
+#
+# Each rule correlates MULTIPLE signals (never a single bare threshold), in
+# line with DBA practice: a wait event is a symptom, not a diagnosis.
+#
+# Rule grammar
+# ------------
+#   when:     list of conditions; ALL must be true for the rule to fire.
+#   any_of:   optional list; at least ONE must be true (corroboration).
+#   condition: {signal, op, value}
+#       op in: ">=", "<=", ">", "<", "==", "!=", "is_null", "not_null", "in"
+#       A condition on a missing (None) signal is False, except is_null.
+#   severity: {signal, bands:[{min|max, level}]}  -> first matching band wins.
+#             or  {static: HIGH}
+#   evidence: list of templates; "{signal}" is substituted. A line that
+#             references a null signal is dropped (so we never print "None").
+#   recommendation: action text shown to the DBA / embedded for RAG.
+#
+# Threshold provenance (starting points; tune per environment/baseline):
+#   - DB CPU >= ~75% of DB time on OLTP  => CPU-bound (practitioner framework).
+#   - AAS > #CPUs => database overloaded / CPU queued.
+#   - Top-events %DB time failing to sum near 100% => CPU-starvation tell.
+#   - db file sequential read avg > ~10ms elevated, >20ms slow storage.
+#   - log file sync avg >10ms suspect, >20ms problem, >50ms severe.
+#   - hard-parse / parse high (>20%) => poor cursor sharing / no bind vars.
+#   - Concurrency wait class significant => latch/buffer-busy contention.
+#   - Library Hit % < 95 / Buffer Hit % < 90 with high PIO => memory pressure.
+# ============================================================================
+
+rules:
+
+  # ── CPU ───────────────────────────────────────────────────────────────────
+  - id: cpu_bottleneck
+    category: CPU
+    finding: "CPU Bottleneck"
+    description: >
+      DB CPU dominates DB time while the host has little idle headroom or the
+      average active sessions exceed the CPU count — the workload is CPU-bound.
+    when:
+      - {signal: db_cpu_pct_db_time, op: ">=", value: 75}
+    any_of:
+      - {signal: host_cpu_idle_pct, op: "<=", value: 25}
+      - {signal: aas_to_cpu_ratio, op: ">=", value: 1.0}
+      - {signal: num_cpus, op: "is_null"}
+    severity:
+      signal: db_cpu_pct_db_time
+      bands:
+        - {min: 90, level: CRITICAL}
+        - {min: 80, level: HIGH}
+        - {min: 75, level: MEDIUM}
+    evidence:
+      - "DB CPU accounts for {db_cpu_pct_db_time}% of DB time"
+      - "Host CPU idle is only {host_cpu_idle_pct}%"
+      - "Average active sessions {average_active_sessions} against {num_cpus} CPUs (ratio {aas_to_cpu_ratio})"
+      - "DB CPU per second: {db_cpu_per_sec}"
+    recommendation: >
+      Tune the statements in Top SQL by CPU Time and by Elapsed Time first —
+      target reductions in logical reads (buffer gets) via better plans and
+      indexing, since CPU is mostly spent processing cached blocks. Check for
+      missing/poor indexes and bad cardinality estimates. Only add CPU capacity
+      if high utilisation is sustained across multiple representative AWR
+      windows, not from a single snapshot.
+
+  - id: cpu_starvation
+    category: CPU
+    finding: "CPU Starvation / Run-Queue Pressure"
+    description: >
+      DB CPU is high, sessions outnumber CPUs, and the Top Events %DB time fails
+      to add up near 100% — a classic sign that Oracle instrumentation is being
+      distorted by processes queueing for CPU (often SMT-masked).
+    when:
+      - {signal: db_cpu_pct_db_time, op: ">=", value: 50}
+      - {signal: aas_to_cpu_ratio, op: ">=", value: 1.0}
+      - {signal: pct_db_time_accounted, op: "<", value: 85}
+    severity:
+      signal: aas_to_cpu_ratio
+      bands:
+        - {min: 2.0, level: CRITICAL}
+        - {min: 1.5, level: HIGH}
+        - {min: 1.0, level: MEDIUM}
+    evidence:
+      - "Average active sessions {average_active_sessions} exceed {num_cpus} CPUs (ratio {aas_to_cpu_ratio})"
+      - "Top events explain only {pct_db_time_accounted}% of DB time"
+      - "Host CPU idle reported as {host_cpu_idle_pct}% (may be SMT-inflated)"
+    recommendation: >
+      Treat reported wait timings with caution — under CPU starvation Oracle's
+      timing is unreliable. Prioritise reducing CPU demand (SQL tuning, cut
+      logical reads, control parallelism / connection counts). Verify true
+      utilisation at the OS level (vmstat/nmon run-queue), remembering that with
+      SMT a low %Idle on logical CPUs can still mean saturated physical cores.
+
+  # ── I/O ───────────────────────────────────────────────────────────────────
+  - id: io_bottleneck
+    category: IO
+    finding: "I/O Bottleneck"
+    description: >
+      User I/O dominates DB time and single-block read latency or per-exec disk
+      reads are elevated — the workload is I/O-bound on the storage subsystem.
+    when:
+      - {signal: user_io_pct_db_time, op: ">=", value: 30}
+    any_of:
+      - {signal: db_file_seq_read_ms, op: ">=", value: 10}
+      - {signal: db_file_scat_read_ms, op: ">=", value: 10}
+      - {signal: user_io_class_avg_ms, op: ">=", value: 10}
+      - {signal: reads_per_exec, op: ">=", value: 100}
+    severity:
+      signal: user_io_pct_db_time
+      bands:
+        - {min: 60, level: CRITICAL}
+        - {min: 45, level: HIGH}
+        - {min: 30, level: MEDIUM}
+    evidence:
+      - "User I/O is {user_io_pct_db_time}% of DB time"
+      - "db file sequential read averages {db_file_seq_read_ms} ms"
+      - "db file scattered read averages {db_file_scat_read_ms} ms"
+      - "Physical reads per execution: {reads_per_exec}"
+      - "Physical reads/sec: {physical_reads_per_sec}"
+    recommendation: >
+      Identify the heaviest statements in Top SQL by Physical Reads and reduce
+      disk access through indexing or plan fixes (turn full scans into index
+      access where appropriate). If average single-block read latency is high
+      (>10 ms) the storage tier itself is slow — check array latency, redo/data
+      file placement, and competing workloads on shared storage.
+
+  # ── COMMIT / REDO ─────────────────────────────────────────────────────────
+  - id: commit_redo_latency
+    category: Commit
+    finding: "Commit / Redo Latency (log file sync)"
+    description: >
+      Sessions are spending significant time waiting on commit, with elevated
+      log file sync latency — redo write throughput or commit frequency is the
+      constraint.
+    when:
+      - {signal: log_file_sync_ms, op: ">=", value: 10}
+    any_of:
+      - {signal: log_file_sync_pct, op: ">=", value: 5}
+      - {signal: commit_class_pct, op: ">=", value: 5}
+    severity:
+      signal: log_file_sync_ms
+      bands:
+        - {min: 50, level: CRITICAL}
+        - {min: 20, level: HIGH}
+        - {min: 10, level: MEDIUM}
+    evidence:
+      - "log file sync averages {log_file_sync_ms} ms per commit"
+      - "log file sync is {log_file_sync_pct}% of DB time"
+      - "Commit wait class is {commit_class_pct}% of DB time"
+    recommendation: >
+      Compare log file sync against log file parallel write: if sync >> parallel
+      write the bottleneck is CPU/run-queue or LGWR posting; if they track each
+      other it is redo write I/O. Move redo logs to low-latency storage (SSD/
+      NVMe), separate redo from data files, and reduce commit frequency in the
+      application (batch commits) where transactional semantics allow.
+
+  # ── PARSE / SQL REUSE ─────────────────────────────────────────────────────
+  - id: hard_parse_pressure
+    category: Parse
+    finding: "Excessive Hard Parsing / Poor Cursor Sharing"
+    description: >
+      A high fraction of parses are hard parses and/or the execute-to-parse
+      ratio is low — SQL is not being reused, wasting CPU in the shared pool.
+    when:
+      - {signal: hard_parse_pct, op: ">=", value: 20}
+    any_of:
+      - {signal: execute_to_parse_pct, op: "<=", value: 50}
+      - {signal: soft_parse_pct, op: "<=", value: 80}
+      - {signal: hard_parses_per_sec, op: ">=", value: 10}
+    severity:
+      signal: hard_parse_pct
+      bands:
+        - {min: 40, level: CRITICAL}
+        - {min: 30, level: HIGH}
+        - {min: 20, level: MEDIUM}
+    evidence:
+      - "Hard parses are {hard_parse_pct}% of all parses"
+      - "Execute-to-parse ratio is {execute_to_parse_pct}%"
+      - "Soft parse ratio is {soft_parse_pct}%"
+      - "Hard parses per second: {hard_parses_per_sec}"
+    recommendation: >
+      Use bind variables instead of literal values so cursors can be shared. As
+      interim relief consider CURSOR_SHARING=FORCE and raise
+      SESSION_CACHED_CURSORS (e.g. 100). Find the offending statements via the
+      parse-heavy SQL and address them at the application layer — literal SQL is
+      the usual root cause.
+
+  # ── CONCURRENCY / CONTENTION ──────────────────────────────────────────────
+  - id: concurrency_contention
+    category: Concurrency
+    finding: "Concurrency / Latch Contention"
+    description: >
+      The Concurrency wait class consumes significant DB time — typically buffer
+      busy waits, cache buffers chains latch, or library cache lock/pin, pointing
+      to hot blocks or shared-pool contention.
+    when:
+      - {signal: concurrency_class_pct, op: ">=", value: 10}
+    severity:
+      signal: concurrency_class_pct
+      bands:
+        - {min: 40, level: CRITICAL}
+        - {min: 25, level: HIGH}
+        - {min: 10, level: MEDIUM}
+    evidence:
+      - "Concurrency wait class is {concurrency_class_pct}% of DB time"
+      - "Concurrency average wait: {concurrency_class_avg_ms} ms"
+    recommendation: >
+      Pinpoint the dominant concurrency event. For buffer busy / cache buffers
+      chains latch, reduce hot-block contention (spread inserts, hash/partition
+      hot segments, raise freelists/ASSM, cache hot sequences). For library
+      cache lock/pin, address hard parsing and frequent DDL/recompilation. Hot
+      blocks are very often a symptom of an inefficient plan doing too many
+      logical reads.
+
+  - id: application_lock_contention
+    category: Application
+    finding: "Application Lock Contention (row/table locks)"
+    description: >
+      The Application wait class is significant — usually enq: TX row lock
+      contention or enq: TM contention from the application's transaction design.
+    when:
+      - {signal: application_class_pct, op: ">=", value: 10}
+    severity:
+      signal: application_class_pct
+      bands:
+        - {min: 30, level: CRITICAL}
+        - {min: 20, level: HIGH}
+        - {min: 10, level: MEDIUM}
+    evidence:
+      - "Application wait class is {application_class_pct}% of DB time"
+    recommendation: >
+      Investigate blocking sessions and the locked objects. enq: TX - row lock
+      contention in mode 6 indicates two sessions updating the same row; mode 4
+      indicates unique/foreign-key/bitmap-index contention (index FK columns,
+      review bitmap indexes on DML-heavy tables). Shorten transactions and review
+      commit/locking strategy in the application.
+
+  # ── MEMORY ────────────────────────────────────────────────────────────────
+  - id: memory_pressure
+    category: Memory
+    finding: "Memory Pressure (cache / shared pool)"
+    description: >
+      Cache hit ratios are low and/or host memory devoted to SGA+PGA is high,
+      coinciding with parse or I/O pressure — memory sizing is constraining
+      performance.
+    when:
+      - {signal: library_hit_pct, op: "<", value: 95}
+    any_of:
+      - {signal: mem_pct_host, op: ">=", value: 90}
+      - {signal: hard_parse_pct, op: ">=", value: 20}
+      - {signal: buffer_hit_pct, op: "<", value: 90}
+    severity:
+      signal: library_hit_pct
+      bands:
+        - {max: 85, level: HIGH}
+        - {max: 92, level: MEDIUM}
+        - {max: 95, level: LOW}
+    evidence:
+      - "Library cache hit ratio is {library_hit_pct}%"
+      - "Buffer cache hit ratio is {buffer_hit_pct}%"
+      - "Host memory used by SGA+PGA: {mem_pct_host}%"
+      - "Hard parse ratio: {hard_parse_pct}%"
+    recommendation: >
+      A low library cache hit ratio usually rides along with hard parsing — fix
+      cursor sharing first. If buffer hit is low with high physical reads,
+      consider enlarging the buffer cache (use the Buffer Pool Advisory) but
+      confirm with wait evidence rather than the ratio alone. Right-size SGA/PGA
+      and verify Automatic Memory Management is not starving one component.
+      Modern tuning trusts wait events over hit ratios — corroborate before
+      resizing.
+
+  # ── CLUSTER / RAC ─────────────────────────────────────────────────────────
+  - id: cluster_interconnect
+    category: Cluster
+    finding: "RAC Cluster / Interconnect Latency"
+    description: >
+      The Cluster wait class (gc cr/current block, gc buffer busy) is significant
+      — cache-fusion block transfer across the interconnect is slow or contended.
+    when:
+      - {signal: cluster_class_pct, op: ">=", value: 15}
+    severity:
+      signal: cluster_class_pct
+      bands:
+        - {min: 40, level: CRITICAL}
+        - {min: 25, level: HIGH}
+        - {min: 15, level: MEDIUM}
+    evidence:
+      - "Cluster wait class is {cluster_class_pct}% of DB time"
+    recommendation: >
+      Check interconnect health and latency (target gc block receive < 1 ms),
+      and look for global hot blocks causing gc buffer busy. Reduce cross-instance
+      block pinging via service/workload partitioning, and confirm the private
+      interconnect is on dedicated low-latency networking (not shared/public).
+
+  # ── INEFFICIENT SQL ───────────────────────────────────────────────────────
+  - id: inefficient_logical_reads
+    category: SQL
+    finding: "CPU Burned on Excessive Logical Reads"
+    description: >
+      CPU is high and the logical-to-physical read ratio is very large — most
+      work is buffer gets from cache, typically inefficient plans scanning far
+      more blocks than necessary.
+    when:
+      - {signal: db_cpu_pct_db_time, op: ">=", value: 60}
+      - {signal: logical_to_physical_ratio, op: ">=", value: 50}
+    severity:
+      static: MEDIUM
+    evidence:
+      - "DB CPU is {db_cpu_pct_db_time}% of DB time"
+      - "Logical-to-physical read ratio is {logical_to_physical_ratio}"
+      - "Logical reads/sec: {logical_reads_per_sec}"
+    recommendation: >
+      The database is reading huge volumes of blocks from cache, burning CPU.
+      Inspect Top SQL by buffer gets / elapsed time for plans doing nested-loop
+      blow-ups or full scans of cached tables; add selective indexes, fix join
+      orders and cardinality estimates to cut logical reads per execution.
