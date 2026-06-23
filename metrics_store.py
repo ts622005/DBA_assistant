@@ -5,11 +5,9 @@ metrics_store.py
 ================
 Structured, timestamped metrics store for the DBA Assistant (Phase 1).
 
-This is the piece the old architecture was missing: parsed AWR metrics were only
-ever flattened into vector text or written to a throwaway JSON file, so numeric,
-historical and time-comparison questions had nothing factual to read from. Here
-every snapshot's metrics are stored in a normal relational schema with INDEXED
-timestamps, making time-based queries first-class:
+Parsed AWR metrics are stored in a relational schema with INDEXED timestamps so
+numeric, historical and time-comparison questions are answered from facts, not
+from the LLM's memory:
 
     "CPU over the last 30 days"      -> SELECT ... WHERE begin_time >= ...
     "what degraded between X and Y"  -> JOIN sql_stat a, sql_stat b ...
@@ -26,6 +24,7 @@ Design rules:
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -112,17 +111,30 @@ CREATE TABLE IF NOT EXISTS addm_finding (
     recommendation TEXT,
     PRIMARY KEY (snapshot_id, finding)
 );
+
+CREATE TABLE IF NOT EXISTS finding (
+    snapshot_id    INTEGER NOT NULL REFERENCES snapshot(snapshot_id) ON DELETE CASCADE,
+    source         TEXT,
+    rule_id        TEXT,
+    category       TEXT,
+    severity       TEXT,
+    finding        TEXT,
+    evidence       TEXT,
+    recommendation TEXT,
+    confidence     REAL,
+    impact_pct     REAL,
+    PRIMARY KEY (snapshot_id, source, finding)
+);
 """
 
 
 def _unit_for(name: str) -> Optional[str]:
-    """Heuristic unit from a metric name suffix — purely descriptive."""
     n = name.lower()
-    if n.endswith("_pct") or "pct" in n or n.endswith("_ratio_pct"):
+    if n.endswith("_pct") or "pct" in n:
         return "pct"
-    if n.endswith("_ms") or n.endswith("_ms)"):
+    if n.endswith("_ms"):
         return "ms"
-    if "per_sec" in n or n.endswith("_per_sec"):
+    if "per_sec" in n:
         return "per_sec"
     if "ratio" in n:
         return "ratio"
@@ -132,7 +144,6 @@ def _unit_for(name: str) -> Optional[str]:
 
 
 def _num(v):
-    """Return a float if v is numeric, else None (skip strings/None)."""
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
@@ -145,22 +156,18 @@ class MetricsStore:
 
     def __init__(self, db_path: str = "dba_assistant.db"):
         self.db_path = db_path
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True) if Path(db_path).parent != Path("") else None
-        self.conn = sqlite3.connect(db_path)
+        parent = Path(db_path).parent
+        if str(parent) not in ("", "."):
+            parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON;")
         self.conn.executescript(_SCHEMA)
         self.conn.commit()
         log.info("MetricsStore ready at %s", db_path)
 
-    # ── ingest ───────────────────────────────────────────────────────────────
-
     def upsert_snapshot(self, report: dict) -> int:
-        """Insert (or replace) one analysed AWR report. Idempotent on report_id.
-
-        Returns the snapshot_id. Re-ingesting the same report wipes and rewrites
-        its child rows so backfills and retries are safe.
-        """
+        """Insert (or replace) one analysed AWR report. Idempotent on report_id."""
         meta = report.get("meta", {}) or {}
         report_id = meta.get("report_id")
         if not report_id:
@@ -170,18 +177,15 @@ class MetricsStore:
         end = meta.get("end_time_iso") or meta.get("end_time") or ""
 
         cur = self.conn.cursor()
-        # Replace any existing snapshot with this report_id (cascade clears children).
         row = cur.execute("SELECT snapshot_id FROM snapshot WHERE report_id=?",
                           (report_id,)).fetchone()
         if row:
             cur.execute("DELETE FROM snapshot WHERE snapshot_id=?", (row["snapshot_id"],))
 
         cur.execute(
-            """INSERT INTO snapshot
-               (report_id, db_name, db_id, instance_number, release, is_rac, host,
-                begin_snap_id, end_snap_id, begin_time, end_time, elapsed_mins,
-                db_time_mins, source_file)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            "INSERT INTO snapshot (report_id, db_name, db_id, instance_number, release, "
+            "is_rac, host, begin_snap_id, end_snap_id, begin_time, end_time, elapsed_mins, "
+            "db_time_mins, source_file) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (report_id, meta.get("db_name"), meta.get("db_id"),
              _num(meta.get("instance_number")), meta.get("release"),
              str(meta.get("is_rac")) if meta.get("is_rac") is not None else None,
@@ -196,13 +200,13 @@ class MetricsStore:
         self._write_sql(cur, sid, report)
         self._write_segments(cur, sid, report)
         self._write_addm(cur, sid, report)
+        self._write_findings(cur, sid, report)
 
         self.conn.commit()
         log.info("Stored snapshot %s (report_id=%s).", sid, report_id)
         return sid
 
     def _write_metrics(self, cur, sid, report):
-        # Merge signals + derived_metrics (derived wins on name clash).
         merged = {}
         merged.update(report.get("meta", {}).get("signals", {}) or {})
         merged.update(report.get("derived_metrics", {}) or {})
@@ -226,7 +230,7 @@ class MetricsStore:
             "INSERT OR REPLACE INTO wait_event "
             "(snapshot_id,kind,name,waits,time_s,avg_wait_ms,pct_db_time,wait_class) "
             "VALUES (?,?,?,?,?,?,?,?)",
-            [r for r in rows if r[2]])  # require a name
+            [r for r in rows if r[2]])
 
     def _write_sql(self, cur, sid, report):
         rows = []
@@ -244,7 +248,7 @@ class MetricsStore:
             "(snapshot_id,sql_id,category,rank,cpu_time_s,elapsed_time_s,"
             "physical_reads,buffer_gets,executions,plan_hash_value,module,sql_text) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            [r for r in rows if r[1]])  # require sql_id
+            [r for r in rows if r[1]])
 
     def _write_segments(self, cur, sid, report):
         rows = []
@@ -271,16 +275,29 @@ class MetricsStore:
             "VALUES (?,?,?,?,?,?)",
             [r for r in rows if r[1]])
 
-    # ── queries (facts only — this is what the Metrics Agent will call) ───────
+    def _write_findings(self, cur, sid, report):
+        rows = []
+        for f in report.get("findings", []) or []:
+            rows.append((
+                sid, f.get("source"), f.get("rule_id"), f.get("category"),
+                f.get("severity"), f.get("finding"),
+                json.dumps(f.get("evidence") or []),
+                f.get("recommendation"), _num(f.get("confidence")),
+                _num(f.get("impact_pct")),
+            ))
+        cur.executemany(
+            "INSERT OR REPLACE INTO finding "
+            "(snapshot_id,source,rule_id,category,severity,finding,evidence,"
+            "recommendation,confidence,impact_pct) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            [r for r in rows if r[5]])
 
-    def metric_series(self, name: str, db_id: Optional[str] = None,
-                      instance_number: Optional[int] = None,
-                      start: Optional[str] = None, end: Optional[str] = None) -> list[dict]:
-        """Time series of one metric, ordered by snapshot begin_time."""
-        sql = ["""SELECT s.begin_time, s.end_time, m.value, m.unit
-                  FROM snapshot s JOIN metric m ON m.snapshot_id = s.snapshot_id
-                  WHERE m.name = ?"""]
-        args: list = [name]
+    # ── queries (facts only — what the Metrics Agent calls) ───────────────────
+
+    def metric_series(self, name, db_id=None, instance_number=None, start=None, end=None):
+        sql = ["SELECT s.begin_time, s.end_time, m.value, m.unit "
+               "FROM snapshot s JOIN metric m ON m.snapshot_id = s.snapshot_id "
+               "WHERE m.name = ?"]
+        args = [name]
         if db_id is not None:
             sql.append("AND s.db_id = ?"); args.append(db_id)
         if instance_number is not None:
@@ -292,11 +309,9 @@ class MetricsStore:
         sql.append("ORDER BY s.begin_time")
         return [dict(r) for r in self.conn.execute(" ".join(sql), args).fetchall()]
 
-    def snapshots_in_range(self, db_id: Optional[str] = None,
-                           instance_number: Optional[int] = None,
-                           start: Optional[str] = None, end: Optional[str] = None) -> list[dict]:
+    def snapshots_in_range(self, db_id=None, instance_number=None, start=None, end=None):
         sql = ["SELECT * FROM snapshot WHERE 1=1"]
-        args: list = []
+        args = []
         if db_id is not None:
             sql.append("AND db_id = ?"); args.append(db_id)
         if instance_number is not None:
@@ -308,26 +323,58 @@ class MetricsStore:
         sql.append("ORDER BY begin_time")
         return [dict(r) for r in self.conn.execute(" ".join(sql), args).fetchall()]
 
-    def sql_stat(self, sql_id: str, snapshot_ids: Optional[list[int]] = None) -> list[dict]:
+    def sql_stat(self, sql_id, snapshot_ids=None):
         sql = ["SELECT ss.*, s.begin_time FROM sql_stat ss "
                "JOIN snapshot s ON s.snapshot_id = ss.snapshot_id WHERE ss.sql_id = ?"]
-        args: list = [sql_id]
+        args = [sql_id]
         if snapshot_ids:
-            placeholders = ",".join("?" * len(snapshot_ids))
-            sql.append(f"AND ss.snapshot_id IN ({placeholders})")
+            ph = ",".join("?" * len(snapshot_ids))
+            sql.append("AND ss.snapshot_id IN (" + ph + ")")
             args.extend(snapshot_ids)
         sql.append("ORDER BY s.begin_time, ss.category")
         return [dict(r) for r in self.conn.execute(" ".join(sql), args).fetchall()]
 
-    def wait_events(self, snapshot_id: int) -> list[dict]:
+    def wait_events(self, snapshot_id, kind="event", limit=10):
         return [dict(r) for r in self.conn.execute(
-            "SELECT * FROM wait_event WHERE snapshot_id = ? ORDER BY pct_db_time DESC",
-            (snapshot_id,)).fetchall()]
+            "SELECT * FROM wait_event WHERE snapshot_id=? AND kind=? "
+            "ORDER BY pct_db_time DESC LIMIT ?", (snapshot_id, kind, limit)).fetchall()]
 
-    def latest_snapshot(self, db_id: Optional[str] = None,
-                        instance_number: Optional[int] = None) -> Optional[dict]:
+    def findings(self, snapshot_id):
+        rows = self.conn.execute(
+            "SELECT * FROM finding WHERE snapshot_id=? "
+            "ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 "
+            "WHEN 'MEDIUM' THEN 2 WHEN 'LOW' THEN 3 ELSE 4 END, confidence DESC",
+            (snapshot_id,)).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["evidence"] = json.loads(d.get("evidence") or "[]")
+            except (ValueError, TypeError):
+                d["evidence"] = []
+            out.append(d)
+        return out
+
+    def top_sql(self, snapshot_id, category, limit=5):
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM sql_stat WHERE snapshot_id=? AND category=? "
+            "ORDER BY rank LIMIT ?", (snapshot_id, category, limit)).fetchall()]
+
+    def metrics(self, snapshot_id, names=None):
+        if names:
+            ph = ",".join("?" * len(names))
+            rows = self.conn.execute(
+                "SELECT name,value,unit FROM metric WHERE snapshot_id=? AND name IN (" + ph + ")",
+                (snapshot_id, *names)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT name,value,unit FROM metric WHERE snapshot_id=?",
+                (snapshot_id,)).fetchall()
+        return {r["name"]: {"value": r["value"], "unit": r["unit"]} for r in rows}
+
+    def latest_snapshot(self, db_id=None, instance_number=None):
         sql = ["SELECT * FROM snapshot WHERE 1=1"]
-        args: list = []
+        args = []
         if db_id is not None:
             sql.append("AND db_id = ?"); args.append(db_id)
         if instance_number is not None:
@@ -336,16 +383,14 @@ class MetricsStore:
         row = self.conn.execute(" ".join(sql), args).fetchone()
         return dict(row) if row else None
 
-    def previous_snapshot(self, snapshot_id: int) -> Optional[dict]:
-        """The snapshot immediately preceding the given one (same db + instance)."""
-        cur = self.conn.execute("SELECT * FROM snapshot WHERE snapshot_id=?", (snapshot_id,))
-        this = cur.fetchone()
+    def previous_snapshot(self, snapshot_id):
+        this = self.conn.execute(
+            "SELECT * FROM snapshot WHERE snapshot_id=?", (snapshot_id,)).fetchone()
         if not this:
             return None
         row = self.conn.execute(
-            """SELECT * FROM snapshot
-               WHERE db_id IS ? AND instance_number IS ? AND begin_time < ?
-               ORDER BY begin_time DESC LIMIT 1""",
+            "SELECT * FROM snapshot WHERE db_id IS ? AND instance_number IS ? "
+            "AND begin_time < ? ORDER BY begin_time DESC LIMIT 1",
             (this["db_id"], this["instance_number"], this["begin_time"])).fetchone()
         return dict(row) if row else None
 
@@ -354,7 +399,7 @@ class MetricsStore:
 
 
 if __name__ == "__main__":
-    import argparse, json
+    import argparse
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
                         datefmt="%H:%M:%S")

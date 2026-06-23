@@ -20,6 +20,7 @@ import streamlit as st
 
 import config
 import pipeline
+from assistant import DBAAssistant, render_markdown, narration_context
 from vector_store import AWRVectorStore
 from metrics_store import MetricsStore
 
@@ -82,19 +83,22 @@ def ensure_ollama() -> None:
             for _ in ollama.pull(model, stream=True):  # streams progress, blocks until done
                 pass
 
-SYSTEM_PROMPT = """You are an expert Oracle DBA assistant specializing in AWR (Automatic Workload Repository) report analysis.
+# The deterministic pipeline (assistant.py) produces the authoritative answer.
+# The LLM is used ONLY to narrate that answer in fluent prose — it must add no new
+# facts, causes, numbers, or recommendations beyond what the pipeline supplied.
+NARRATION_SYSTEM = """You are an expert Oracle DBA assistant. You will be given a
+STRUCTURED ANALYSIS (root causes, evidence, recommendations, missing evidence) that
+was computed deterministically from an AWR report.
 
-When answering, always structure your response as:
-### Root Cause Analysis
-[Explain the likely root cause using metric values from the context]
+Your ONLY job is to summarise it in 2-4 sentences of clear prose for a DBA.
 
-### Supporting Evidence
-[List specific AWR metrics, wait events, or SQL IDs that back the analysis]
-
-### Recommendations
-[Give concrete, actionable steps to resolve the issue]
-
-Be specific. Reference actual numbers from the context. If the context does not contain enough information, say so clearly."""
+Strict rules:
+- Add NOTHING that is not in the structured analysis: no new metrics, SQL IDs,
+  causes, or recommendations.
+- Never claim a full table scan, missing index, or plan problem unless it appears
+  in the structured analysis (it won't, unless execution-plan data was available).
+- If 'missing evidence' is listed, mention briefly that the conclusion is limited
+  by it. Keep it short; the structured detail is shown to the user separately."""
 
 
 # ── cached resources (survive Streamlit reruns) ──────────────────────────────
@@ -115,6 +119,11 @@ def get_metrics_store() -> MetricsStore:
     return MetricsStore(config.METRICS_DB)
 
 
+@st.cache_resource(show_spinner="Loading reasoning pipeline…")
+def get_assistant() -> DBAAssistant:
+    return DBAAssistant(get_metrics_store())
+
+
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def run_pipeline_and_ingest(uploaded_file, store: AWRVectorStore,
@@ -126,23 +135,13 @@ def run_pipeline_and_ingest(uploaded_file, store: AWRVectorStore,
     return pipeline.analyze_and_ingest(tmp_path, store, metrics_store=metrics_store)
 
 
-def build_prompt(question: str, chunks: list[dict]) -> str:
-    context_parts = []
-    for c in chunks:
-        doc_type = c["metadata"].get("doc_type", "info")
-        score = c["score"]
-        context_parts.append(f"[{doc_type} | relevance {score}]\n{c['text']}")
-    context = "\n\n---\n\n".join(context_parts)
-    return f"{context}\n\nQuestion: {question}"
-
-
-def stream_llama(question: str, chunks: list[dict]):
-    user_content = build_prompt(question, chunks)
+def narrate(contract: dict):
+    """Stream a short LLM narration constrained to the contract's own facts."""
     for chunk in ollama.chat(
         model=OLLAMA_MODEL,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": user_content},
+            {"role": "system", "content": NARRATION_SYSTEM},
+            {"role": "user", "content": narration_context(contract)},
         ],
         stream=True,
     ):
@@ -239,34 +238,42 @@ if question:
         st.markdown(question)
 
     store = get_store()
-    chunks = store.query(question, n_results=n_chunks)
+    assistant = get_assistant()
 
-    if not chunks:
-        answer = "No relevant AWR data found. Try rephrasing or ingest more reports."
-        with st.chat_message("assistant"):
-            st.markdown(answer)
-        st.session_state.messages.append({"role": "assistant", "content": answer})
-    else:
-        with st.chat_message("assistant"):
+    # Retrieve vector context (best-effort) — used for confidence corroboration and
+    # for the optional narration; the structured pipeline is the source of truth.
+    chunks = []
+    try:
+        chunks = store.query(question, n_results=n_chunks)
+    except Exception as e:
+        logging.warning("vector query failed: %s", e)
+
+    # ── Sequential pipeline (Phase 3): classify → gate → metrics → rca → rec ──
+    contract = assistant.answer(question, vector_chunks=chunks or None)
+    md = render_markdown(contract)
+
+    with st.chat_message("assistant"):
+        narrated = None
+        # Optional LLM narration — constrained to the contract's own facts. Never
+        # the source of truth; if Ollama is unavailable we just show the contract.
+        if contract["answer_scope"] != "none":
             try:
-                answer = st.write_stream(stream_llama(question, chunks))
-                with st.expander("Retrieved AWR context", expanded=False):
-                    for c in chunks:
-                        st.markdown(
-                            f"**[{c['score']}] {c['metadata'].get('doc_type', '')}**  "
-                            f"`{c['metadata'].get('category', c['metadata'].get('sql_category', ''))}`"
-                        )
-                        st.caption(c["text"][:300])
-                        st.divider()
-            except ollama.ResponseError as e:
-                answer = f"Ollama error: {e}. Make sure `ollama run {OLLAMA_MODEL}` is running."
-                st.error(answer)
+                narrated = st.write_stream(narrate(contract))
+                st.divider()
             except Exception as e:
-                answer = f"Error: {e}"
-                st.error(answer)
+                logging.info("narration skipped: %s", e)
+        st.markdown(md)
+        if chunks:
+            with st.expander("Retrieved AWR context", expanded=False):
+                for c in chunks:
+                    st.markdown(
+                        f"**[{c['score']}] {c['metadata'].get('doc_type', '')}**  "
+                        f"`{c['metadata'].get('category', c['metadata'].get('sql_category', ''))}`"
+                    )
+                    st.caption(c["text"][:300])
+                    st.divider()
 
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": answer,
-            "chunks": chunks,
-        })
+    answer = (narrated + "\n\n" if narrated else "") + md
+    st.session_state.messages.append({
+        "role": "assistant", "content": answer, "chunks": chunks,
+    })

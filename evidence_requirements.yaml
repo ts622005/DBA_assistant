@@ -1,0 +1,113 @@
+# ============================================================================
+# evidence_requirements.yaml  --  Evidence Verification Layer (Phase 2)
+# ============================================================================
+# Maps a QUESTION INTENT to the EVIDENCE required to answer it honestly. This is
+# the mechanism that makes "I cannot determine because execution plans are
+# unavailable" the DEFAULT when evidence is insufficient — instead of letting the
+# model invent a cause.
+#
+# Like rules.yaml, this is DATA, not code. Tune behaviour by editing this file.
+#
+# Per-intent grammar
+# ------------------
+#   match:   keywords/phrases; the classifier picks the FIRST intent (top-to-
+#            bottom) with a hit. Order = priority (most specific first).
+#   needs:   HARD evidence requirements. If any is absent, the question is NOT
+#            answerable — the assistant refuses and names what is missing.
+#   recommends: SOFT evidence. If absent, the assistant still answers but flags
+#            it as missing, caps confidence, and treats the conclusion as partial.
+#   answerable_from_awr: true | false | partial
+#            false   -> always refuse (AWR fundamentally cannot answer this).
+#            partial -> answer with caveats even if all 'needs' are present.
+#            true    -> answer normally when 'needs' are satisfied.
+#   refusal: text shown when the question cannot be answered.
+#   note:    caveat appended to partial answers.
+#
+# Evidence type tokens (produced by evidence_agent.available_evidence):
+#   sql_stat, wait_events, wait_classes, time_model, instance_cpu, memory,
+#   segments, addm, two_or_more_snapshots, plan_hash_history,
+#   execution_plan, sql_monitor, ash   <-- last three are NEVER present yet
+# ============================================================================
+
+intents:
+
+  # ── Questions AWR fundamentally cannot answer (refuse) ────────────────────
+  full_table_scan:
+    match: ["full table scan", "full table scans", "full scan", "table scan", "fts"]
+    needs: [execution_plan]
+    answerable_from_awr: false
+    refusal: >
+      Cannot determine from AWR alone whether a SQL statement performs a full
+      table scan. AWR reports resource consumption (CPU, reads, waits), not the
+      access path. Execution plan data (DBMS_XPLAN or a SQL Monitor report) is
+      required. I can, however, list the statements with the highest physical
+      reads as candidates to investigate.
+
+  # ── Index questions: answerable only as candidates, plan needed to confirm ─
+  index_benefit:
+    match: ["benefit most from indexing", "benefit from indexing", "benefit from an index",
+            "would benefit from index", "which sql should be indexed", "candidates for indexing",
+            "need indexing", "needs an index", "add an index", "add indexes", "missing index"]
+    needs: [sql_stat]
+    recommends: [execution_plan]
+    answerable_from_awr: partial
+    note: >
+      AWR can identify high physical-read / high-buffer-get statements as INDEXING
+      CANDIDATES, but cannot confirm an index would help without the execution
+      plan. Treat these as candidates, not conclusions.
+
+  index_usage:
+    match: ["not using an index", "use an index", "using an index", "not use an index",
+            "why .* index", "ignoring the index", "index even if one exists"]
+    needs: [sql_stat]
+    recommends: [execution_plan, plan_hash_history]
+    answerable_from_awr: partial
+    note: >
+      Whether a statement uses an existing index is a property of its execution
+      plan, which AWR does not contain. I can report its measured cost and waits,
+      but any statement about index usage is speculative without DBMS_XPLAN.
+
+  # ── Questions AWR answers well (with the right sections present) ───────────
+  cpu_bottleneck:
+    match: ["cpu bottleneck", "high cpu", "cpu bound", "cpu usage", "burning cpu",
+            "cpu pressure", "top offender", "consuming cpu", "cpu time"]
+    needs: [time_model, instance_cpu]
+    answerable_from_awr: true
+
+  io_bottleneck:
+    match: ["i/o", "io bottleneck", "physical reads", "disk", "storage", "read latency",
+            "sequential read", "scattered read", "user i/o"]
+    needs: [wait_events, wait_classes]
+    answerable_from_awr: true
+
+  parse_issue:
+    match: ["hard parse", "soft parse", "cursor sharing", "bind variable", "parsing"]
+    needs: [time_model]
+    answerable_from_awr: true
+
+  commit_latency:
+    match: ["log file sync", "commit", "redo", "lgwr"]
+    needs: [wait_events]
+    answerable_from_awr: true
+
+  concurrency:
+    match: ["latch", "buffer busy", "concurrency", "enqueue", "lock contention", "contention"]
+    needs: [wait_classes]
+    answerable_from_awr: true
+
+  # ── Historical / comparison (needs >=2 snapshots) ─────────────────────────
+  trend_comparison:
+    match: ["trend", "over the last", "compared to", "compare", "what changed", "since",
+            "degraded", "regression", "worse than", "better than", "yesterday", "last week",
+            "this week", "over time", "30 days", "between"]
+    needs: [two_or_more_snapshots]
+    answerable_from_awr: true
+    note: >
+      Comparison requires at least two snapshots in range. If only one is present
+      the question cannot be answered historically.
+
+  # ── Catch-all factual/summary ─────────────────────────────────────────────
+  general:
+    match: []
+    needs: []
+    answerable_from_awr: true

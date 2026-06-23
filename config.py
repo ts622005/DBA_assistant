@@ -36,11 +36,11 @@ OLLAMA_API = os.environ.get("DBA_OLLAMA_API", "http://localhost:11434")
 
 # ── Embedder selection (the single pin) ──────────────────────────────────────
 # Default to local BGE: self-contained, deterministic, no network egress.
-_EMBEDDER_SPEC = os.environ.get("DBA_EMBEDDER", "bge")
+_EMBEDDER_SPEC = os.environ.get("DBA_EMBEDDER", "ollama:nomic-embed-text")
 
 # Known dimensions so we can tag/verify the Chroma collection.
 _KNOWN_DIMS = {
-    "bge-small-en-v1.5": 384,
+    "BAAI/bge-small-en-v1.5": 384,
     "nomic-embed-text": 768,
     "bge-m3": 1024,
 }
@@ -49,8 +49,8 @@ _KNOWN_DIMS = {
 def _parse_spec(spec: str) -> tuple[str, str]:
     """Return (backend, model). 'bge' -> ('bge','bge-small-en-v1.5')."""
     spec = (spec or "bge").strip()
-    if spec.lower() in ("bge", "bge-small", "bge-small-en-v1.5"):
-        return "bge", "bge-small-en-v1.5"
+    if spec.lower() in ("bge", "bge-small", "bge-small-en-v1.5", "baai/bge-small-en-v1.5"):
+        return "bge", "BAAI/bge-small-en-v1.5"
     if spec.lower().startswith("ollama:"):
         return "ollama", spec.split(":", 1)[1].strip()
     # Bare model name -> assume local sentence-transformers.

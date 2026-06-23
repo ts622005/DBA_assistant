@@ -28,14 +28,16 @@ Version 1.0 · Target codebase: `C:\technorise` · Author: architecture review
 - RCA Agent
 - Recommendation Agent
 
-**Phase 4**
-- Historical Comparison Engine
-- Regression Detection
+**Phase 4** — _(none for now)_
+- Reserved. The Historical Comparison Engine is deferred to Phase 5 (future);
+  see below. No work is scheduled here until a comparison/trending need is real.
 
 **Phase 5 (Future)**
+- Historical Comparison Engine
+- Regression Detection (incl. plan-hash change detection)
 - Execution Plans
 - SQL Monitor Reports
-- ASH Reports
+- Conversational memory (bounded multi-turn context)
 - Agent Orchestration
 
 This prevents spending days building an agent framework before the actual problem
@@ -734,14 +736,21 @@ highest-impact, lowest-risk change (grounding the answer path) lands first.
 - *Deliverable:* every answer carries a confidence band, cited evidence, and
   cleanly refuses when the evidence gate fails.
 
-### Phase 4 — Historical comparison engine + regression detection
-- Add `comparison_engine.py` + comparison thresholds YAML.
-- Add date-resolution ("June 20", "yesterday") → snapshot lookup.
-- Parse plan hash + buffer-gets SQL (§4.4) to enable plan-change + regression.
-- *Deliverable:* "what changed between X and Y", "what degraded this week".
+### Phase 4 — (reserved / no work scheduled)
+Deferred by decision: the Historical Comparison Engine is in Phase 5. Nothing is
+planned for Phase 4 until a concrete comparison/trending need arises. (Plan-hash and
+buffer-gets parsing were already delivered in Phase 1, so the data is ready when the
+engine is eventually built.)
 
-### Phase 5 — Future sources
-- Add execution-plan parsing first (highest unlock), then ASH / baselines as needed.
+### Phase 5 — Future sources & comparison
+- **Historical Comparison Engine + regression detection** — `comparison_engine.py`
+  + thresholds YAML, date-resolution ("June 20", "yesterday") → snapshot lookup,
+  plan-hash change + per-SQL regression. ("what changed between X and Y".)
+- Execution-plan parsing (highest unlock — flips index/FTS intents to answerable),
+  then SQL Monitor reports, AWR baselines, incident history.
+- **Conversational memory** — bounded multi-turn context (carry last sql_id /
+  intent / snapshot; feed only the last 1-2 turns to narration). Deliberately
+  deferred; the deterministic gate/RCA stay stateless for grounding.
 
 ### Suggested module layout after refactor
 
